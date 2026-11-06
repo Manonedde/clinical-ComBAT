@@ -105,6 +105,24 @@ def _build_arg_parser():
                         "the harmonized data.")
     p.add_argument("--metric",
                    help="Metric to display (default: first metric found).")
+    add_figure_args(p)
+    p.add_argument("--out_html", default="harmonization_plotly.html",
+                   help="Output HTML file [%(default)s].")
+    p.add_argument("--title", default=None, help="Figure title.")
+    p.add_argument("--use_cdn", action="store_true",
+                   help="Load plotly.js from a CDN instead of embedding it "
+                        "in the HTML (lighter file, ~4 MB less, but needs "
+                        "internet to be displayed).")
+    p.add_argument("--html_fragment", action="store_true",
+                   help="Write only an HTML <div> fragment (no <html>/<body>),"
+                        " to be inserted in another HTML page/report.")
+    add_verbose_arg(p)
+    add_overwrite_arg(p)
+    return p
+
+
+def add_figure_args(p):
+    """Display options (shared with combat_report_plotly)."""
     p.add_argument("--bundles", nargs="+",
                    help="Bundles to display (default: all bundles).")
     p.add_argument("--window_size", type=float, default=4.0,
@@ -123,19 +141,6 @@ def _build_arg_parser():
                    help="Only display the median curve of the moving sites.")
     p.add_argument("--hide_disease", action="store_true",
                    help="Remove non-HC subjects.")
-    p.add_argument("--out_html", default="harmonization_plotly.html",
-                   help="Output HTML file [%(default)s].")
-    p.add_argument("--title", default=None, help="Figure title.")
-    p.add_argument("--use_cdn", action="store_true",
-                   help="Load plotly.js from a CDN instead of embedding it "
-                        "in the HTML (lighter file, ~4 MB less, but needs "
-                        "internet to be displayed).")
-    p.add_argument("--html_fragment", action="store_true",
-                   help="Write only an HTML <div> fragment (no <html>/<body>),"
-                        " to be inserted in another HTML page/report.")
-    add_verbose_arg(p)
-    add_overwrite_arg(p)
-    return p
 
 
 def sliding_percentiles(ages, values, percentiles, window, step, min_count,
@@ -361,13 +366,15 @@ def add_info_cards(fig, cards, y0, y1, px_per_x, px_per_y,
                            font=dict(size=12.5, color="#1f2a37"))
 
 
-def build_qc_table(bhatt, bundle):
+def build_qc_table(bhatt, bundle, bhatt_refs=None):
     """Bhattacharyya distance before/after harmonization for one bundle."""
     rows, fills = [], []
     for label, (raw, harm) in bhatt.items():
         pre, post = raw[0].get(bundle, np.nan), harm[0].get(bundle, np.nan)
         change = 100.0 * (post - pre) / pre if pre else np.nan
-        rows.append([label, str(raw[1]), _fmt(pre), _fmt(post),
+        vs = (bhatt_refs or {}).get(label)
+        rows.append([label + (f" (vs {vs})" if vs else ""),
+                     str(raw[1]), _fmt(pre), _fmt(post),
                      _fmt(change, "{:+.1f} %")])
         fills.append("#e3f4ea" if post < pre else
                      "#fbe5e5" if post > pre else "white")
@@ -394,6 +401,15 @@ def band_trace(x, lo, hi, name, **kwargs):
         hoverinfo="name", **kwargs)
 
 
+def _bundle_count(d_raw, d_harm, is_reference):
+    """'42 bundles' or, for a moving site with bundles that could not be
+    harmonized (NaN), '41/42 bundles harmonized'."""
+    n_raw, n_harm = d_raw["bundle"].nunique(), d_harm["bundle"].nunique()
+    if is_reference or n_harm == n_raw:
+        return f"{n_raw} bundles"
+    return f"{n_harm}/{n_raw} bundles harmonized"
+
+
 def _hex_to_rgb(color):
     color = color.lstrip("#")
     return ", ".join(str(int(color[i:i + 2], 16)) for i in (0, 2, 4))
@@ -406,67 +422,66 @@ def _ax(row, col):
     return "" if idx == 1 else str(idx)
 
 
-def main():
-    parser = _build_arg_parser()
-    args = parser.parse_args()
-    logging.getLogger().setLevel(logging.getLevelName(args.verbose))
+METHOD_NAMES = {"clinical": "Clinical-ComBAT", "pairwise": "Pairwise-ComBAT"}
 
-    assert_outputs_exist(parser, args, args.out_html)
-    if 50 not in args.percentiles:
-        parser.error("--percentiles must contain 50.")
-    if bool(args.bhattacharyya_raw) != bool(args.bhattacharyya_harmonized) or (
-            args.bhattacharyya_raw and len(args.bhattacharyya_raw)
-            != len(args.bhattacharyya_harmonized)):
-        parser.error("--bhattacharyya_raw and --bhattacharyya_harmonized "
-                     "must be given together, with the same number of files.")
+PLOTLY_CONFIG = dict(displaylogo=False,
+                     toImageButtonOptions=dict(format="png", scale=2,
+                                               filename="harmonization"))
 
-    df_raw = load_sites_data(args.raw)
-    df_harm = load_sites_data(args.harmonized)
 
-    methods = [args.method] if args.method else [
-        m for m in df_harm["harmonization"].unique() if m != "raw"]
-    method_names = {"clinical": "Clinical-ComBAT",
-                    "pairwise": "Pairwise-ComBAT"}
-    method_title = " / ".join(
-        method_names.get(str(m).lower(), f"{str(m).capitalize()}-ComBAT")
+def method_display_name(methods):
+    """'clinical' -> 'Clinical-ComBAT' (several methods joined with ' / ')."""
+    return " / ".join(
+        METHOD_NAMES.get(str(m).lower(), f"{str(m).capitalize()}-ComBAT")
         for m in methods) or "ComBAT"
 
-    metric = args.metric or df_raw["metric"].unique()[0]
-    metric_label = metric.upper()
+
+def prepare_data(df_raw, df_harm, metric, reference_site=None,
+                 hide_disease=False):
+    """Select one metric, add the reference site (unchanged by the
+    harmonization) to the harmonized data and keep the common sites."""
     df_raw = df_raw[df_raw["metric"] == metric]
     df_harm = df_harm[df_harm["metric"] == metric]
-    if args.hide_disease:
+    if hide_disease:
         df_raw = df_raw[df_raw["disease"] == "HC"]
         df_harm = df_harm[df_harm["disease"] == "HC"]
-
-    # The reference site is not modified by harmonization: add its raw data
-    # to the "after" data if it is not already present.
-    if args.reference_site is not None:
-        if args.reference_site not in df_raw["site"].unique():
-            parser.error(f"Reference site '{args.reference_site}' not found "
-                         "in the raw data.")
-        if args.reference_site not in df_harm["site"].unique():
+    if reference_site is not None:
+        if reference_site not in df_raw["site"].unique():
+            raise ValueError(f"Reference site '{reference_site}' not found "
+                             f"in the raw data ({metric}).")
+        if reference_site not in df_harm["site"].unique():
             df_harm = pd.concat(
-                [df_harm, df_raw[df_raw["site"] == args.reference_site]])
+                [df_harm, df_raw[df_raw["site"] == reference_site]])
+    df_raw = df_raw[df_raw["site"].isin(set(df_harm["site"].unique()))]
+    return df_raw, df_harm
+
+
+def build_figure(df_raw, df_harm, metric, args, bhatt=None,
+                 method_title="ComBAT", title=None, bhatt_refs=None):
+    """Build the plotly figure (one animation frame per bundle).
+
+    df_raw, df_harm: data returned by prepare_data().
+    args: namespace with the add_figure_args() options + reference_site.
+    bhatt: {moving site: ((dists, N), (dists, N))}, raw / harmonized
+           Bhattacharyya distances (see read_bhattacharyya).
+    """
+    bhatt = bhatt or {}
+    # Sites whose Bhattacharyya distance was computed against another site
+    # than the displayed reference (e.g. chained harmonization: MTL -> QCSH).
+    bhatt_refs = {k: v for k, v in (bhatt_refs or {}).items()
+                  if v and v != args.reference_site}
+    metric_label = metric.upper()
     harm_sites = set(df_harm["site"].unique())
-    df_raw = df_raw[df_raw["site"].isin(harm_sites)]
 
     bundles = args.bundles or sorted(
         set(df_raw["bundle"]).intersection(df_harm["bundle"]))
     if not bundles:
-        parser.error("No common bundle between raw and harmonized data.")
+        raise ValueError("No common bundle between raw and harmonized data.")
 
     sites = sorted(harm_sites, key=lambda s: (s != args.reference_site, s))
     colors = {s: SITE_COLORS[i % len(SITE_COLORS)] for i, s in enumerate(sites)}
     age_range = padded_range(
         np.concatenate([df_raw["age"].values, df_harm["age"].values]), 0.02)
-
-    # --- QC (Bhattacharyya) files ---
-    bhatt = {}
-    for f_raw, f_harm in zip(args.bhattacharyya_raw or [],
-                             args.bhattacharyya_harmonized or []):
-        bhatt[bhattacharyya_label(f_raw, f_harm)] = (
-            read_bhattacharyya(f_raw), read_bhattacharyya(f_harm))
 
     # --- Info cards: one per site (N, age) + mean QC for moving sites ---
     def qc_line(label):
@@ -474,7 +489,8 @@ def main():
         pre = np.nanmean(list(raw[0].values()))
         post = np.nanmean(list(harm[0].values()))
         color = "#1a7f45" if post < pre else "#b42318"
-        return (f"<span style='color:#5b6573'>Bhattacharyya (mean "
+        vs = f" vs {bhatt_refs[label]}" if label in bhatt_refs else ""
+        return (f"<span style='color:#5b6573'>Bhattacharyya{vs} (mean "
                 f"{len(raw[0])} bundles)</span><br>{pre:.3g} → {post:.3g} "
                 f"<b><span style='color:{color}'>"
                 f"({100 * (post - pre) / pre:+.1f} %)</span></b>")
@@ -486,8 +502,9 @@ def main():
         text = (f"<b><span style='font-size:16px;color:{colors[site]}'>"
                 f"{site}</span></b>  <span style='color:#5b6573'>{role}</span>"
                 f"<br><b>{d['sid'].nunique()}</b> subjects · "
-                f"{d['bundle'].nunique()} bundles"
-                f"<br>Age {d['age'].min():.1f}–{d['age'].max():.1f} y "
+                + _bundle_count(d, df_harm[df_harm["site"] == site],
+                                site == args.reference_site)
+                + f"<br>Age {d['age'].min():.1f}–{d['age'].max():.1f} y "
                 f"({d['age'].mean():.1f} ± {d['age'].std():.1f})")
         if site in bhatt:
             text += "<br>" + qc_line(site)
@@ -538,7 +555,7 @@ def main():
         tables = [build_age_table(df_raw, b, sites, colors,
                                   args.reference_site)]
         if bhatt:
-            tables.append(build_qc_table(bhatt, b))
+            tables.append(build_qc_table(bhatt, b, bhatt_refs))
         frames.append(go.Frame(
             name=b, data=traces + tables,
             layout={f"yaxis{_ax(r, c)}": dict(range=y_ranges[b])
@@ -584,7 +601,7 @@ def main():
 
     fig.update_layout(
         title=dict(
-            text=f"<b>{args.title or method_title}</b>",
+            text=f"<b>{title or method_title}</b>",
             subtitle=dict(
                 text=f"{metric_label} harmonization · reference: "
                 f"{args.reference_site or 'pooled'} · moving: "
@@ -616,6 +633,43 @@ def main():
             currentvalue=dict(prefix="Bundle: ", font=dict(size=16)),
         )],
     )
+    return fig
+
+
+def main():
+    parser = _build_arg_parser()
+    args = parser.parse_args()
+    logging.getLogger().setLevel(logging.getLevelName(args.verbose))
+
+    assert_outputs_exist(parser, args, args.out_html)
+    if 50 not in args.percentiles:
+        parser.error("--percentiles must contain 50.")
+    if bool(args.bhattacharyya_raw) != bool(args.bhattacharyya_harmonized) or (
+            args.bhattacharyya_raw and len(args.bhattacharyya_raw)
+            != len(args.bhattacharyya_harmonized)):
+        parser.error("--bhattacharyya_raw and --bhattacharyya_harmonized "
+                     "must be given together, with the same number of files.")
+
+    df_raw = load_sites_data(args.raw)
+    df_harm = load_sites_data(args.harmonized)
+
+    methods = [args.method] if args.method else [
+        m for m in df_harm["harmonization"].unique() if m != "raw"]
+    metric = args.metric or df_raw["metric"].unique()[0]
+
+    bhatt = {}
+    for f_raw, f_harm in zip(args.bhattacharyya_raw or [],
+                             args.bhattacharyya_harmonized or []):
+        bhatt[bhattacharyya_label(f_raw, f_harm)] = (
+            read_bhattacharyya(f_raw), read_bhattacharyya(f_harm))
+
+    try:
+        df_raw, df_harm = prepare_data(df_raw, df_harm, metric,
+                                       args.reference_site, args.hide_disease)
+        fig = build_figure(df_raw, df_harm, metric, args, bhatt,
+                           method_display_name(methods), args.title)
+    except ValueError as e:
+        parser.error(str(e))
 
     fig.write_html(
         args.out_html,
@@ -623,9 +677,7 @@ def main():
         full_html=not args.html_fragment,
         auto_play=False,
         div_id="combat-harmonization",
-        config=dict(displaylogo=False,
-                    toImageButtonOptions=dict(format="png", scale=2,
-                                              filename="harmonization")))
+        config=PLOTLY_CONFIG)
     logging.info("Saved %s", args.out_html)
 
 
